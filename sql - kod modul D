@@ -1,0 +1,257 @@
+-- =============================================
+-- МОДУЛЬ Д. SQL-аналитика и витрины отчетности
+-- Схема: team_01
+-- Источник данных: stg (orders, order_items, products)
+-- Бизнес-логика: анализ только доставленных заказов
+-- =============================================
+
+
+-- =============================================
+-- ВИТРИНА 1. БАЗОВАЯ ВИТРИНА ПРОДАЖ
+-- Цель: сформировать единую витрину для аналитики продаж
+-- Что считаем:
+--   - выручка = price из order_items
+--   - дата заказа = order_purchase_ts
+-- Фильтры:
+--   - учитываются только доставленные заказы (order_status = 'delivered')
+-- Допущения:
+--   - возвраты и отмененные заказы не включаются в выручку
+--   - если категория товара отсутствует, допускается NULL
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_sales_base AS
+SELECT
+    o.order_id,                          -- уникальный идентификатор заказа
+    o.customer_id,                       -- идентификатор клиента
+    o.order_purchase_ts::date AS order_date, -- дата покупки (без времени)
+    DATE_TRUNC('month', o.order_purchase_ts) AS month,     -- месяц покупки
+    DATE_TRUNC('quarter', o.order_purchase_ts) AS quarter, -- квартал покупки
+    DATE_TRUNC('year', o.order_purchase_ts) AS year,       -- год покупки
+    oi.product_id,                       -- идентификатор товара
+    p.product_category_name,             -- категория товара
+    oi.price AS revenue                  -- выручка по позиции заказа
+FROM stg.orders o
+JOIN stg.order_items oi 
+    ON o.order_id = oi.order_id          -- соединяем заказы и товары в заказе
+LEFT JOIN stg.products p 
+    ON oi.product_id = p.product_id      -- добавляем категорию товара
+WHERE o.order_status = 'delivered';      -- фильтр: только завершенные заказы
+
+
+-- =============================================
+-- ВИТРИНА 2. МЕСЯЧНАЯ ДИНАМИКА
+-- Цель: анализ динамики бизнеса по месяцам
+-- Метрики:
+--   - total_revenue — суммарная выручка
+--   - orders_count — количество заказов
+--   - customers_count — количество уникальных клиентов
+-- Использование: для построения графиков динамики
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_monthly_metrics AS
+SELECT
+    month,                               -- месяц анализа
+    SUM(revenue) AS total_revenue,       -- суммарная выручка за месяц
+    COUNT(DISTINCT order_id) AS orders_count,      -- число заказов
+    COUNT(DISTINCT customer_id) AS customers_count -- число уникальных клиентов
+FROM team_01.v_sales_base
+GROUP BY month
+ORDER BY month;
+
+
+-- =============================================
+-- ВИТРИНА 3. КВАРТАЛЬНАЯ ДИНАМИКА И QoQ
+-- Цель: оценка роста/падения выручки квартал к кварталу (QoQ)
+-- Метод:
+--   - агрегирование по кварталам
+--   - LAG() для сравнения с предыдущим кварталом
+-- Допущение:
+--   - если предыдущий квартал отсутствует, рост = NULL
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_quarterly_qoq AS
+WITH quarterly AS (
+    SELECT
+        quarter,                         -- квартал
+        SUM(revenue) AS revenue          -- выручка за квартал
+    FROM team_01.v_sales_base
+    GROUP BY quarter
+)
+SELECT
+    quarter,
+    revenue,
+    LAG(revenue) OVER (ORDER BY quarter) AS prev_quarter_revenue, -- выручка прошлого квартала
+    ROUND(
+        (revenue - LAG(revenue) OVER (ORDER BY quarter))
+        / NULLIF(LAG(revenue) OVER (ORDER BY quarter), 0) * 100, 2
+    ) AS qoq_growth_percent              -- процент изменения QoQ
+FROM quarterly
+ORDER BY quarter;
+
+
+-- =============================================
+-- ВИТРИНА 4. ГОДОВАЯ ДИНАМИКА И YoY
+-- Цель: расчет годового роста (Year-over-Year)
+-- Метод:
+--   - сравнение текущего года с предыдущим через LAG()
+-- Метрика:
+--   - yoy_growth_percent — темп роста в %
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_yearly_yoy AS
+WITH yearly AS (
+    SELECT
+        year,                            -- год
+        SUM(revenue) AS revenue          -- годовая выручка
+    FROM team_01.v_sales_base
+    GROUP BY year
+)
+SELECT
+    year,
+    revenue,
+    LAG(revenue) OVER (ORDER BY year) AS prev_year_revenue, -- выручка прошлого года
+    ROUND(
+        (revenue - LAG(revenue) OVER (ORDER BY year))
+        / NULLIF(LAG(revenue) OVER (ORDER BY year), 0) * 100, 2
+    ) AS yoy_growth_percent              -- годовой темп роста (YoY)
+FROM yearly
+ORDER BY year;
+
+
+-- =============================================
+-- ВИТРИНА 5. ТОП-КАТЕГОРИИ ТОВАРОВ
+-- Цель: выявление наиболее прибыльных категорий
+-- Метрики:
+--   - total_revenue — выручка по категории
+--   - orders_count — количество заказов
+-- Метод:
+--   - ранжирование через RANK()
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_top_categories AS
+SELECT
+    product_category_name,               -- категория товара
+    SUM(revenue) AS total_revenue,       -- суммарная выручка категории
+    COUNT(DISTINCT order_id) AS orders_count, -- число заказов
+    RANK() OVER (ORDER BY SUM(revenue) DESC) AS revenue_rank -- ранг по выручке
+FROM team_01.v_sales_base
+GROUP BY product_category_name
+ORDER BY total_revenue DESC;
+
+
+-- =============================================
+-- ВИТРИНА 6. ТОП-ТОВАРЫ
+-- Цель: анализ наиболее продаваемых товаров
+-- Метрики:
+--   - total_revenue — выручка по товару
+--   - items_sold — количество проданных единиц
+-- Метод:
+--   - DENSE_RANK для формирования рейтинга товаров
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_top_products AS
+SELECT
+    product_id,                          -- товар
+    product_category_name,               -- категория товара
+    SUM(revenue) AS total_revenue,       -- выручка по товару
+    COUNT(*) AS items_sold,              -- количество продаж (шт.)
+    DENSE_RANK() OVER (ORDER BY SUM(revenue) DESC) AS product_rank -- ранг товара
+FROM team_01.v_sales_base
+GROUP BY product_id, product_category_name
+ORDER BY total_revenue DESC;
+
+
+-- =============================================
+-- ВИТРИНА 7. ТОП-КЛИЕНТЫ
+-- Цель: определение наиболее ценных клиентов
+-- Метрики:
+--   - total_spent — суммарные траты клиента
+--   - orders_count — количество заказов
+-- Использование: клиентская аналитика и сегментация
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_top_customers AS
+SELECT
+    customer_id,                         -- клиент
+    SUM(revenue) AS total_spent,         -- общая сумма покупок
+    COUNT(DISTINCT order_id) AS orders_count, -- число заказов клиента
+    DENSE_RANK() OVER (ORDER BY SUM(revenue) DESC) AS customer_rank -- ранг клиента
+FROM team_01.v_sales_base
+GROUP BY customer_id
+ORDER BY total_spent DESC;
+
+
+-- =============================================
+-- ВИТРИНА 8. НАКОПИТЕЛЬНАЯ ВЫРУЧКА (оконные функции)
+-- Цель: анализ накопительного итога выручки во времени
+-- Метод:
+--   - SUM() OVER (ORDER BY month)
+-- Требование задания: использование оконных функций
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_cumulative_revenue AS
+WITH monthly AS (
+    SELECT
+        month,
+        SUM(revenue) AS monthly_revenue  -- выручка за месяц
+    FROM team_01.v_sales_base
+    GROUP BY month
+)
+SELECT
+    month,
+    monthly_revenue,
+    SUM(monthly_revenue) OVER (ORDER BY month) AS cumulative_revenue -- накопительная выручка
+FROM monthly
+ORDER BY month;
+
+
+-- =============================================
+-- ВИТРИНА 9. ABC-СЕГМЕНТАЦИЯ КЛИЕНТОВ
+-- Цель: сегментация клиентов по вкладу в выручку
+-- Логика:
+--   A — 80% выручки (ключевые клиенты)
+--   B — следующие 15%
+--   C — остальные клиенты
+-- Метод:
+--   - кумулятивная доля выручки через оконные функции
+-- =============================================
+CREATE OR REPLACE VIEW team_01.v_abc_customers AS
+WITH client_revenue AS (
+    SELECT
+        customer_id,
+        SUM(revenue) AS revenue          -- выручка по клиенту
+    FROM team_01.v_sales_base
+    GROUP BY customer_id
+),
+calc AS (
+    SELECT
+        customer_id,
+        revenue,
+        SUM(revenue) OVER () AS total_revenue, -- общая выручка
+        SUM(revenue) OVER (ORDER BY revenue DESC) AS cumulative_revenue -- накопительная выручка
+    FROM client_revenue
+)
+SELECT
+    customer_id,
+    revenue,
+    ROUND(cumulative_revenue / total_revenue, 4) AS cumulative_share, -- доля выручки
+    CASE
+        WHEN cumulative_revenue / total_revenue <= 0.80 THEN 'A'
+        WHEN cumulative_revenue / total_revenue <= 0.95 THEN 'B'
+        ELSE 'C'
+    END AS abc_segment               -- сегмент ABC
+FROM calc
+ORDER BY revenue DESC;
+
+
+-- =============================================
+-- МАТЕРИАЛИЗОВАННАЯ ВИТРИНА ДЛЯ BI
+-- Цель: оптимизированная витрина для дашбордов и отчетности
+-- Преимущества:
+--   - быстрые запросы в BI (Power BI / Tableau)
+--   - агрегированные данные по месяцам и категориям
+-- Обновление:
+--   REFRESH MATERIALIZED VIEW team_01.mv_bi_dashboard;
+-- =============================================
+CREATE MATERIALIZED VIEW team_01.mv_bi_dashboard AS
+SELECT
+    month,                               -- месяц
+    product_category_name,               -- категория товара
+    SUM(revenue) AS total_revenue,       -- выручка
+    COUNT(DISTINCT order_id) AS orders_count, -- количество заказов
+    COUNT(DISTINCT customer_id) AS customers_count -- количество клиентов
+FROM team_01.v_sales_base
+GROUP BY month, product_category_name
+ORDER BY month, total_revenue DESC;
